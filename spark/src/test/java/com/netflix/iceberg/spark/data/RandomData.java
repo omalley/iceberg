@@ -25,17 +25,20 @@ import com.netflix.iceberg.types.TypeUtil;
 import com.netflix.iceberg.types.Types;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericData.Record;
+import sun.reflect.generics.visitor.Visitor;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Random;
 import java.util.UUID;
 import java.util.function.Supplier;
 
 public class RandomData {
-  public static List<Record> generate(Schema schema, int numRecords, long seed) {
+  public static List<Record> generateList(Schema schema, int numRecords, long seed) {
     RandomDataGenerator generator = new RandomDataGenerator(schema, seed);
     List<Record> records = Lists.newArrayListWithExpectedSize(numRecords);
     for (int i = 0; i < numRecords; i += 1) {
@@ -43,6 +46,27 @@ public class RandomData {
     }
 
     return records;
+  }
+
+  public static Iterable<Record> generate(Schema schema, int numRecords, long seed) {
+    return () -> new Iterator<Record>() {
+      private RandomDataGenerator generator = new RandomDataGenerator(schema, seed);
+      private int count = 0;
+
+      @Override
+      public boolean hasNext() {
+        return count < numRecords;
+      }
+
+      @Override
+      public Record next() {
+        if (count >= numRecords) {
+          throw new NoSuchElementException();
+        }
+        count += 1;
+        return (Record) TypeUtil.visit(schema, generator);
+      }
+    };
   }
 
   private static class RandomDataGenerator extends TypeUtil.CustomOrderSchemaVisitor<Object> {
