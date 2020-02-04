@@ -23,13 +23,25 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.orc.ORCSchemaUtil;
 import org.apache.iceberg.orc.OrcValueReader;
 import org.apache.iceberg.types.Types;
 import org.apache.orc.TypeDescription;
@@ -53,6 +65,9 @@ public class GenericOrcReader implements OrcValueReader<Record> {
   private final List<TypeDescription> columns;
   private final Converter[] converters;
 
+  private static final OffsetDateTime EPOCH = Instant.ofEpochSecond(0).atOffset(ZoneOffset.UTC);
+  private static final LocalDate EPOCH_DAY = EPOCH.toLocalDate();
+
   private GenericOrcReader(Schema expectedSchema, TypeDescription readSchema) {
     this.schema = expectedSchema;
     this.columns = readSchema.getChildren();
@@ -70,8 +85,7 @@ public class GenericOrcReader implements OrcValueReader<Record> {
     return newConverters;
   }
 
-  public static OrcValueReader<Record> buildReader(Schema expectedSchema,
-                                                   TypeDescription fileSchema) {
+  public static OrcValueReader<Record> buildReader(Schema expectedSchema, TypeDescription fileSchema) {
     return new GenericOrcReader(expectedSchema, fileSchema);
   }
 
@@ -136,6 +150,30 @@ public class GenericOrcReader implements OrcValueReader<Record> {
     }
   }
 
+  private static class TimeConverter implements Converter<LocalTime> {
+    @Override
+    public LocalTime convert(ColumnVector vector, int row) {
+      int rowIndex = vector.isRepeating ? 0 : row;
+      if (!vector.noNulls && vector.isNull[rowIndex]) {
+        return null;
+      } else {
+        return LocalTime.ofNanoOfDay(((LongColumnVector) vector).vector[rowIndex] * 1_000);
+      }
+    }
+  }
+
+  private static class DateConverter implements Converter<LocalDate> {
+    @Override
+    public LocalDate convert(ColumnVector vector, int row) {
+      int rowIndex = vector.isRepeating ? 0 : row;
+      if (!vector.noNulls && vector.isNull[rowIndex]) {
+        return null;
+      } else {
+        return EPOCH_DAY.plusDays((int) ((LongColumnVector) vector).vector[rowIndex]);
+      }
+    }
+  }
+
   private static class LongConverter implements Converter<Long> {
     @Override
     public Long convert(ColumnVector vector, int row) {
@@ -172,14 +210,13 @@ public class GenericOrcReader implements OrcValueReader<Record> {
     }
   }
 
-  private static class TimestampConverter implements Converter<Long> {
-    private Long convert(TimestampColumnVector vector, int row) {
-      // compute microseconds past 1970.
-      return (vector.time[row] / 1000) * 1_000_000 + vector.nanos[row] / 1000;
+  private static class TimestampTzConverter implements Converter<OffsetDateTime> {
+    private OffsetDateTime convert(TimestampColumnVector vector, int row) {
+      return EPOCH.plus(vector.time[row] / 1_000, ChronoUnit.SECONDS).plus(vector.nanos[row], ChronoUnit.NANOS);
     }
 
     @Override
-    public Long convert(ColumnVector vector, int row) {
+    public OffsetDateTime convert(ColumnVector vector, int row) {
       int rowIndex = vector.isRepeating ? 0 : row;
       if (!vector.noNulls && vector.isNull[rowIndex]) {
         return null;
@@ -189,7 +226,31 @@ public class GenericOrcReader implements OrcValueReader<Record> {
     }
   }
 
-  private static class BinaryConverter implements Converter<byte[]> {
+  private static class TimestampConverter implements Converter<LocalDateTime> {
+    private final ZoneId localZoneId;
+
+    TimestampConverter() {
+      this.localZoneId = ZoneId.systemDefault();
+    }
+
+    private LocalDateTime convert(TimestampColumnVector vector, int row) {
+      return ZonedDateTime
+          .ofInstant(Instant.ofEpochSecond(vector.time[row] / 1_000, vector.nanos[row]), localZoneId)
+          .toLocalDateTime();
+    }
+
+    @Override
+    public LocalDateTime convert(ColumnVector vector, int row) {
+      int rowIndex = vector.isRepeating ? 0 : row;
+      if (!vector.noNulls && vector.isNull[rowIndex]) {
+        return null;
+      } else {
+        return convert((TimestampColumnVector) vector, rowIndex);
+      }
+    }
+  }
+
+  private static class FixedConverter implements Converter<byte[]> {
     @Override
     public byte[] convert(ColumnVector vector, int row) {
       int rowIndex = vector.isRepeating ? 0 : row;
@@ -197,9 +258,42 @@ public class GenericOrcReader implements OrcValueReader<Record> {
         return null;
       } else {
         BytesColumnVector bytesVector = (BytesColumnVector) vector;
-        return Arrays.copyOfRange(bytesVector.vector[rowIndex],
-            bytesVector.start[rowIndex],
+        return Arrays.copyOfRange(bytesVector.vector[rowIndex], bytesVector.start[rowIndex],
             bytesVector.start[rowIndex] + bytesVector.length[rowIndex]);
+      }
+    }
+  }
+
+  private static class BinaryConverter implements Converter<ByteBuffer> {
+    @Override
+    public ByteBuffer convert(ColumnVector vector, int row) {
+      int rowIndex = vector.isRepeating ? 0 : row;
+      if (!vector.noNulls && vector.isNull[rowIndex]) {
+        return null;
+      } else {
+        BytesColumnVector bytesVector = (BytesColumnVector) vector;
+        ByteBuffer buf = ByteBuffer.allocate(bytesVector.length[rowIndex]);
+        buf.put(bytesVector.vector[rowIndex], bytesVector.start[rowIndex], bytesVector.length[rowIndex]);
+        buf.rewind();
+        return buf;
+      }
+    }
+  }
+
+  private static class UUIDConverter implements Converter<UUID> {
+    @Override
+    public UUID convert(ColumnVector vector, int row) {
+      int rowIndex = vector.isRepeating ? 0 : row;
+      if (!vector.noNulls && vector.isNull[rowIndex]) {
+        return null;
+      } else {
+        BytesColumnVector bytesVector = (BytesColumnVector) vector;
+        ByteBuffer buf = ByteBuffer.allocate(16);
+        buf.put(bytesVector.vector[rowIndex], bytesVector.start[rowIndex], 16);
+        buf.rewind();
+        long mostSigBits = buf.getLong();
+        long leastSigBits = buf.getLong();
+        return new UUID(mostSigBits, leastSigBits);
       }
     }
   }
@@ -207,12 +301,14 @@ public class GenericOrcReader implements OrcValueReader<Record> {
   private static class StringConverter implements Converter<String> {
     @Override
     public String convert(ColumnVector vector, int row) {
-      BinaryConverter converter = new BinaryConverter();
-      byte[] byteData = converter.convert(vector, row);
-      if (byteData == null) {
+      int rowIndex = vector.isRepeating ? 0 : row;
+      if (!vector.noNulls && vector.isNull[rowIndex]) {
         return null;
+      } else {
+        BytesColumnVector bytesVector = (BytesColumnVector) vector;
+        return new String(bytesVector.vector[rowIndex], bytesVector.start[rowIndex], bytesVector.length[rowIndex],
+            StandardCharsets.UTF_8);
       }
-      return new String(byteData, StandardCharsets.UTF_8);
     }
   }
 
@@ -223,8 +319,8 @@ public class GenericOrcReader implements OrcValueReader<Record> {
       if (!vector.noNulls && vector.isNull[rowIndex]) {
         return null;
       } else {
-        return ((DecimalColumnVector) vector).vector[rowIndex]
-            .getHiveDecimal().bigDecimalValue();
+        DecimalColumnVector cv = (DecimalColumnVector) vector;
+        return cv.vector[rowIndex].getHiveDecimal().bigDecimalValue().setScale(cv.scale);
       }
     }
   }
@@ -236,11 +332,7 @@ public class GenericOrcReader implements OrcValueReader<Record> {
       Preconditions.checkArgument(icebergField.type().isListType());
       TypeDescription child = schema.getChildren().get(0);
 
-      childConverter = buildConverter(icebergField
-          .type()
-          .asListType()
-          .fields()
-          .get(0), child);
+      childConverter = buildConverter(icebergField.type().asListType().fields().get(0), child);
     }
 
     List<?> readList(ListColumnVector vector, int row) {
@@ -283,10 +375,9 @@ public class GenericOrcReader implements OrcValueReader<Record> {
       final int offset = (int) vector.offsets[row];
       final int length = (int) vector.lengths[row];
 
-      // serialize the keys
-      Map<String, Object> map = Maps.newHashMapWithExpectedSize(length);
+      Map<Object, Object> map = Maps.newHashMapWithExpectedSize(length);
       for (int c = 0; c < length; ++c) {
-        String key = String.valueOf(keyConvert.convert(vector.keys, offset + c));
+        Object key = keyConvert.convert(vector.keys, offset + c);
         Object value = valueConvert.convert(vector.values, offset + c);
         map.put(key, value);
       }
@@ -341,8 +432,7 @@ public class GenericOrcReader implements OrcValueReader<Record> {
     }
   }
 
-  private static Converter buildConverter(final Types.NestedField icebergField,
-                                          final TypeDescription schema) {
+  private static Converter buildConverter(final Types.NestedField icebergField, final TypeDescription schema) {
     switch (schema.getCategory()) {
       case BOOLEAN:
         return new BooleanConverter();
@@ -351,20 +441,43 @@ public class GenericOrcReader implements OrcValueReader<Record> {
       case SHORT:
         return new ShortConverter();
       case DATE:
+        return new DateConverter();
       case INT:
         return new IntConverter();
       case LONG:
-        return new LongConverter();
+        ORCSchemaUtil.LongType longType =
+            ORCSchemaUtil.LongType.valueOf(schema.getAttributeValue(ORCSchemaUtil.ICEBERG_LONG_TYPE_ATTRIBUTE));
+        switch (longType) {
+          case TIME:
+            return new TimeConverter();
+          case LONG:
+            return new LongConverter();
+          default:
+            throw new IllegalStateException("Unhandled Long type found in ORC type attribute: " + longType);
+        }
       case FLOAT:
         return new FloatConverter();
       case DOUBLE:
         return new DoubleConverter();
       case TIMESTAMP:
         return new TimestampConverter();
+      case TIMESTAMP_INSTANT:
+        return new TimestampTzConverter();
       case DECIMAL:
         return new DecimalConverter();
       case BINARY:
-        return new BinaryConverter();
+        ORCSchemaUtil.BinaryType binaryType =
+            ORCSchemaUtil.BinaryType.valueOf(schema.getAttributeValue(ORCSchemaUtil.ICEBERG_BINARY_TYPE_ATTRIBUTE));
+        switch (binaryType) {
+          case UUID:
+            return new UUIDConverter();
+          case FIXED:
+            return new FixedConverter();
+          case BINARY:
+            return new BinaryConverter();
+          default:
+            throw new IllegalStateException("Unhandled Binary type found in ORC type attribute: " + binaryType);
+        }
       case STRING:
       case CHAR:
       case VARCHAR:
