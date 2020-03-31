@@ -339,9 +339,8 @@ public class GenericOrcWriter implements OrcValueWriter<Record> {
       } else {
         output.isNull[rowId] = false;
         TimestampColumnVector cv = (TimestampColumnVector) output;
-        long micros = ChronoUnit.MICROS.between(EPOCH, data);
-        cv.time[rowId] = micros / 1_000; // millis
-        cv.nanos[rowId] = (int) (micros % 1_000_000) * 1_000; // nanos
+        cv.time[rowId] = data.toInstant().toEpochMilli(); // millis
+        cv.nanos[rowId] = data.getNano(); // nanos
       }
     }
   }
@@ -366,9 +365,9 @@ public class GenericOrcWriter implements OrcValueWriter<Record> {
       } else {
         output.isNull[rowId] = false;
         TimestampColumnVector cv = (TimestampColumnVector) output;
-        long micros = ChronoUnit.MICROS.between(EPOCH, data.atZone(localZoneId));
-        cv.time[rowId] = micros / 1_000; // millis
-        cv.nanos[rowId] = (int) (micros % 1_000_000) * 1_000; // nanos
+        cv.setIsUTC(true);
+        cv.time[rowId] = data.toInstant(ZoneOffset.UTC).toEpochMilli(); // millis
+        cv.nanos[rowId] = data.getNano(); // nanos
       }
     }
   }
